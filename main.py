@@ -1,7 +1,7 @@
 import customtkinter as ctk
 import os
 import shutil
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageGrab
 from tkinter import filedialog, messagebox, simpledialog
 import subprocess
 import tkinter as tk
@@ -16,6 +16,39 @@ import base64
 import socket
 import hashlib
 import time
+import random  # For secure delete overwrite
+
+try:
+    import cv2
+    OPENCV_AVAILABLE = True
+except ImportError:
+    OPENCV_AVAILABLE = False
+    print("Pustaka opencv-python tidak ditemukan. Thumbnail video tidak akan berfungsi. Silakan instal dengan 'pip install opencv-python'.")
+
+try:
+    import pygame
+    PYGAME_AVAILABLE = True
+    pygame.mixer.init()
+except ImportError:
+    PYGAME_AVAILABLE = False
+    print("Pustaka pygame tidak ditemukan. Pemutar audio tidak akan berfungsi. Silakan instal dengan 'pip install pygame'.")
+
+try:
+    from pdf2image import convert_from_path
+    from PIL import Image
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+    print("Pustaka pdf2image tidak ditemukan. Pratinjau PDF tidak akan berfungsi. Silakan instal dengan 'pip install pdf2image pillow'. Pastikan poppler juga terinstal di sistem Anda.")
+
+try:
+    from mutagen.mp3 import MP3
+    from mutagen.wave import WAVE
+    from mutagen.flac import FLAC
+    MUTAGEN_AVAILABLE = True
+except ImportError:
+    MUTAGEN_AVAILABLE = False
+    print("Pustaka mutagen tidak ditemukan. Fitur durasi audio tidak akan berfungsi. Silakan instal dengan 'pip install mutagen'.")
 
 # --- Konfigurasi dan Fungsi Dasar ---
 ctk.set_appearance_mode("System")
@@ -23,13 +56,10 @@ ctk.set_default_color_theme("blue")
 
 def get_base_dir():
     if sys.platform == "win32":
-        # Windows: Use AppData\Local
         return os.path.join(os.environ["LOCALAPPDATA"], "ExploFileManager")
     elif sys.platform == "darwin":
-        # macOS: Use Application Support
         return os.path.join(os.path.expanduser("~"), "Library", "Application Support", "ExploFileManager")
     else:
-        # Linux and other Unix-like systems: Use .local/share
         return os.path.join(os.path.expanduser("~"), ".local", "share", "ExploFileManager")
 
 BASE_DIR = get_base_dir()
@@ -144,7 +174,7 @@ class LoginWindow(ctk.CTkToplevel):
             messagebox.showerror("Error", "Username atau password salah!", parent=self)
     
     def on_close(self):
-        self.destroy()
+        self.master.destroy()
 
 class App(ctk.CTk):
     def __init__(self):
@@ -154,8 +184,7 @@ class App(ctk.CTk):
         
         self.icon_size = 120
         self.thumbnail_size = (self.icon_size, self.icon_size)
-        self.load_icons()
-
+        
         self.login_window = LoginWindow(self)
         self.wait_window(self.login_window)
 
@@ -171,6 +200,7 @@ class App(ctk.CTk):
             self.tags_file = os.path.join(self.storage_path, "tags.json")
             self.load_tags()
             self.load_config()
+            self.load_icons()
 
             self.view_mode = "grid"
             self.sort_by = "name"
@@ -179,6 +209,17 @@ class App(ctk.CTk):
 
             self.nav_history = [{"view": "dashboard", "path": self.storage_path}]
             
+            self.audio_length = 0
+            self.current_play_time = 0
+            self.audio_playing = False
+            self.audio_thread = None
+            self.time_label = None
+            self.loop_audio = False  # New flag for looping audio
+            self.current_audio_path = None  # To store current audio path for loop
+
+            self.copied_path = None
+            self.cut_mode = False
+
             self.create_main_layout()
             self.show_dashboard_view()
         else:
@@ -190,15 +231,26 @@ class App(ctk.CTk):
                 with open(CONFIG_FILE, "r") as f:
                     config = json.load(f)
                     self.show_hidden_files = config.get("show_hidden_files", False)
+                    self.sidebar_width = config.get("sidebar_width", 200)
+                    self.details_width = config.get("details_width", 300)
             except (IOError, json.JSONDecodeError):
                 self.show_hidden_files = False
+                self.sidebar_width = 200
+                self.details_width = 300
         else:
             self.show_hidden_files = False
+            self.sidebar_width = 200
+            self.details_width = 300
             
     def save_config(self):
         try:
             with open(CONFIG_FILE, "w") as f:
-                json.dump({"show_hidden_files": self.show_hidden_files}, f)
+                config = {
+                    "show_hidden_files": self.show_hidden_files,
+                    "sidebar_width": self.sidebar_frame.winfo_width(),
+                    "details_width": self.details_frame.winfo_width(),
+                }
+                json.dump(config, f)
         except IOError:
             messagebox.showerror("Error", "Could not save configuration.")
 
@@ -252,7 +304,13 @@ class App(ctk.CTk):
                 "trash": self.load_single_icon("trash_icon.png", small_icon_size),
                 "file_edit": self.load_single_icon("file_edit_icon.png", thumb_icon_size),
                 "eye_open": self.load_single_icon("eye_open_icon.png", small_icon_size),
-                "eye_closed": self.load_single_icon("eye_closed_icon.png", small_icon_size)
+                "eye_closed": self.load_single_icon("eye_closed_icon.png", small_icon_size),
+                "log": self.load_single_icon("log_icon.png", small_icon_size),
+                "audio": self.load_single_icon("audio_icon.png", thumb_icon_size),
+                "play": self.load_single_icon("play_icon.png", small_icon_size),
+                "stop": self.load_single_icon("stop_icon.png", small_icon_size),
+                "pdf": self.load_single_icon("pdf_icon.png", thumb_icon_size),
+                "loop": self.load_single_icon("loop_icon.png", small_icon_size),  # Pastikan ikon ini ada di folder assets
             }
         except Exception as e:
             print(f"Gagal memuat ikon aplikasi: {e}")
@@ -288,12 +346,33 @@ class App(ctk.CTk):
         self.content_frame = self.create_content_area()
         self.details_frame = self.create_details_panel()
 
-        self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
-        self.content_frame.grid(row=0, column=1, sticky="nsew")
-        self.details_frame.grid(row=0, column=2, sticky="nsew")
+        self.sidebar_frame.grid(row=0, column=0, sticky="nsew", padx=(0,0), pady=(0,0))
+        self.content_frame.grid(row=0, column=1, sticky="nsew", padx=(0,0), pady=(0,0))
+        self.details_frame.grid(row=0, column=2, sticky="nsew", padx=(0,0), pady=(0,0))
+        
+        self.grid_columnconfigure(0, minsize=100, weight=0)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_columnconfigure(2, minsize=100, weight=0)
+        
+        self.details_frame_width = self.details_width
+        self.details_frame_resize_handle = ctk.CTkFrame(self, cursor="sb_h_double_arrow", width=5, fg_color="gray")
+        self.details_frame_resize_handle.place(relx=1, rely=0, relheight=1, anchor="ne")
+        self.details_frame_resize_handle.bind("<B1-Motion>", self.resize_details_panel)
+        self.details_frame_resize_handle.bind("<ButtonRelease-1>", self.on_resize_release)
+
+    def resize_details_panel(self, event):
+        x = self.winfo_x() + self.winfo_width()
+        new_width = x - event.x_root
+        if 100 < new_width < self.winfo_width() - 200:
+            self.details_frame_width = new_width
+            self.grid_columnconfigure(2, minsize=self.details_frame_width)
+            self.details_frame_resize_handle.place(x=self.winfo_width() - new_width - 2, rely=0)
+
+    def on_resize_release(self, event):
+        self.save_config()
 
     def create_sidebar(self):
-        sidebar = ctk.CTkFrame(self, corner_radius=0, width=200, fg_color="#1E1E1E")
+        sidebar = ctk.CTkFrame(self, corner_radius=0, width=self.sidebar_width, fg_color="#1E1E1E")
         ctk.CTkLabel(sidebar, text="Explo", font=("Arial", 28, "bold")).pack(pady=(20, 10))
         ctk.CTkLabel(sidebar, text=f"Welcome, {self.current_user}", font=("Arial", 14), text_color="#A9A9A9").pack(pady=(0, 20))
         
@@ -303,8 +382,10 @@ class App(ctk.CTk):
             ("Favorites", self.icons["favorites"], self.show_favorites_view),
             ("Filter by Tag", self.icons["settings"], self.show_tag_filter_dialog),
             ("Auto-Sort", self.icons["settings"], self.auto_sort_files),
+            ("Auto-Tag Files", self.icons["settings"], self.auto_tag_files),
             ("Secret Folder", self.icons["secret"], self.show_secret_folder_view),
             ("Recycle Bin", self.icons["trash"], self.show_recycle_bin_view),
+            ("Activity Log", self.icons["log"], self.show_activity_log_view),
             ("Share via WiFi", self.icons["wifi"], self.start_wifi_share),
             ("Settings", self.icons["settings"], self.show_settings_view),
         ]
@@ -317,6 +398,51 @@ class App(ctk.CTk):
         ctk.CTkButton(sidebar, text="Logout", command=self.logout, fg_color="red", hover_color="darkred", corner_radius=8).pack(pady=(20, 10), padx=10, fill="x", side="bottom")
         return sidebar
     
+    def auto_tag_files(self):
+        tag_rules = {
+            'extension': {
+                ('.jpg', '.jpeg', '.png', '.gif', '.bmp'): 'Gambar',
+                ('.pdf', '.docx', '.xlsx', '.pptx', '.txt'): 'Dokumen',
+                ('.mp4', '.mkv', '.avi', '.mov'): 'Video',
+                ('.zip', '.rar', '.7z'): 'Arsip',
+            },
+            'keyword': {
+                'laporan': 'Laporan',
+                'keuangan': 'Keuangan',
+                'tugas': 'Tugas',
+                'proyek': 'Proyek',
+                'project': 'Proyek',
+            }
+        }
+
+        files_to_tag = []
+        for root, _, files in os.walk(self.storage_path):
+            for file in files:
+                file_path = os.path.join(root, file)
+                files_to_tag.append(file_path)
+
+        for file_path in files_to_tag:
+            item_tags = self.tags.get(file_path, [])
+            file_name = os.path.basename(file_path)
+            file_extension = os.path.splitext(file_name)[1].lower()
+
+            # Rule 1: Tag by extension
+            for extensions, tag in tag_rules['extension'].items():
+                if file_extension in extensions and tag not in item_tags:
+                    item_tags.append(tag)
+                    
+            # Rule 2: Tag by keyword in filename
+            for keyword, tag in tag_rules['keyword'].items():
+                if keyword in file_name.lower() and tag not in item_tags:
+                    item_tags.append(tag)
+            
+            if item_tags:
+                self.tags[file_path] = item_tags
+
+        self.save_tags()
+        messagebox.showinfo("Auto-Tag", "File tagging completed.")
+        self.refresh_file_list()
+
     def auto_sort_files(self):
         if not messagebox.askyesno("Auto-Sort", "Are you sure you want to automatically sort your files? This action will move your files into designated folders."):
             return
@@ -378,8 +504,14 @@ class App(ctk.CTk):
         self.show_hidden_button = ctk.CTkButton(self.header_frame, text="", image=self.icons["eye_closed"] if not self.show_hidden_files else self.icons["eye_open"], width=40, command=self.toggle_hidden_files, corner_radius=8, fg_color="transparent", hover_color="#3A3D3E")
         self.show_hidden_button.grid(row=0, column=5, padx=(5, 0))
 
+        self.upload_button = ctk.CTkButton(self.header_frame, text="Upload", image=self.icons["upload"], compound="left", command=self.upload_file, corner_radius=8)
+        self.upload_button.grid(row=0, column=6, padx=(10, 0))
+
         self.create_new_button = ctk.CTkButton(self.header_frame, text="Create New", image=self.icons["plus"], compound="left", command=self.show_create_new_menu, corner_radius=8)
-        self.create_new_button.grid(row=0, column=6, padx=(10, 0))
+        self.create_new_button.grid(row=0, column=7, padx=(10, 0))
+
+        self.paste_button = ctk.CTkButton(self.header_frame, text="Paste", command=self.paste_item, corner_radius=8)
+        self.paste_button.grid(row=0, column=8, padx=(10, 0))
 
         self.content_view_frame = ctk.CTkFrame(content, fg_color="transparent")
         self.content_view_frame.grid(row=1, column=0, sticky="nsew", padx=20, pady=10)
@@ -387,6 +519,20 @@ class App(ctk.CTk):
         self.file_list_frame = ctk.CTkScrollableFrame(self.content_view_frame, fg_color="transparent")
         
         return content
+
+    def upload_file(self):
+        file_path = filedialog.askopenfilename(parent=self)
+        if file_path:
+            file_name = os.path.basename(file_path)
+            destination_path = os.path.join(self.current_path, file_name)
+            
+            try:
+                shutil.copy2(file_path, destination_path)
+                messagebox.showinfo("Success", f"File '{file_name}' uploaded successfully.")
+                self.refresh_file_list()
+                log_activity(self.current_user, "uploaded file", destination_path)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to upload file: {e}")
 
     def toggle_hidden_files(self):
         self.show_hidden_files = not self.show_hidden_files
@@ -411,7 +557,7 @@ class App(ctk.CTk):
             self.refresh_file_list()
 
     def create_details_panel(self):
-        details = ctk.CTkFrame(self, corner_radius=0, fg_color="#1E1E1E", width=300)
+        details = ctk.CTkFrame(self, corner_radius=0, fg_color="#1E1E1E", width=self.details_width)
         details.pack_propagate(False)
 
         ctk.CTkLabel(details, text="File Details", font=("Arial", 20, "bold")).pack(pady=10)
@@ -422,8 +568,8 @@ class App(ctk.CTk):
         self.detail_name_label = ctk.CTkLabel(details, text="", font=("Arial", 16, "bold"), wraplength=280)
         self.detail_name_label.pack(pady=(5, 0))
 
-        self.detail_info_label = ctk.CTkLabel(details, text="", justify="left", wraplength=280)
-        self.detail_info_label.pack(pady=(0, 10), padx=10)
+        self.detail_info_frame = ctk.CTkScrollableFrame(details, fg_color="transparent")
+        self.detail_info_frame.pack(fill="both", expand=True, padx=10, pady=10)
         
         return details
         
@@ -654,6 +800,21 @@ class App(ctk.CTk):
         self.file_list_frame.grid_columnconfigure((0, 1, 2, 3, 4), weight=1)
         self.path_label.configure(text="Path: Recycle Bin")
 
+        # Add Select All and Delete Selected buttons
+        control_frame = ctk.CTkFrame(self.content_view_frame)
+        control_frame.pack(fill="x", pady=10)
+
+        self.select_all_checkbox = ctk.CTkCheckBox(control_frame, text="Select All", command=self.toggle_select_all_recycle)
+        self.select_all_checkbox.pack(side="left", padx=10)
+
+        delete_selected_button = ctk.CTkButton(control_frame, text="Delete Selected Permanently", command=self.delete_selected_recycle_permanently)
+        delete_selected_button.pack(side="left", padx=10)
+
+        restore_selected_button = ctk.CTkButton(control_frame, text="Restore Selected", command=self.restore_selected_recycle)
+        restore_selected_button.pack(side="left", padx=10)
+
+        self.recycle_checkboxes = {}  # To store checkboxes for each item
+
         try:
             items = sorted(os.listdir(recycle_bin_path))
             
@@ -667,7 +828,59 @@ class App(ctk.CTk):
                     row += 1
         except FileNotFoundError:
             ctk.CTkLabel(self.file_list_frame, text="Recycle Bin is empty.", fg_color="transparent").grid(row=0, column=0, pady=20)
-    
+
+    def toggle_select_all_recycle(self):
+        state = self.select_all_checkbox.get()
+        for path, checkbox in self.recycle_checkboxes.items():
+            if state:
+                checkbox.select()
+            else:
+                checkbox.deselect()
+
+    def delete_selected_recycle_permanently(self):
+        selected_paths = [path for path, checkbox in self.recycle_checkboxes.items() if checkbox.get()]
+        if not selected_paths:
+            messagebox.showinfo("Info", "No items selected.")
+            return
+
+        if messagebox.askyesno("Delete Permanently", "Are you sure you want to permanently delete the selected items? This cannot be undone."):
+            for path in selected_paths:
+                self.delete_item_permanently(path)
+            self.show_recycle_bin_view()
+
+    def restore_selected_recycle(self):
+        selected_paths = [path for path, checkbox in self.recycle_checkboxes.items() if checkbox.get()]
+        if not selected_paths:
+            messagebox.showinfo("Info", "No items selected.")
+            return
+
+        for path in selected_paths:
+            self.restore_item(path)
+        self.show_recycle_bin_view()
+
+    def show_activity_log_view(self):
+        self.update_nav_history("activity_log", None)
+        self.back_button.grid()
+        for widget in self.content_view_frame.winfo_children():
+            widget.destroy()
+        
+        ctk.CTkLabel(self.content_view_frame, text="Activity Log", font=("Arial", 24, "bold")).pack(pady=(0, 20), anchor="w")
+
+        log_text_frame = ctk.CTkFrame(self.content_view_frame, corner_radius=10)
+        log_text_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        log_textbox = ctk.CTkTextbox(log_text_frame, wrap="word", font=("Courier New", 12))
+        log_textbox.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        try:
+            with open(LOG_FILE, "r") as f:
+                content = f.read()
+                log_textbox.insert("1.0", content)
+        except Exception as e:
+            log_textbox.insert("1.0", f"Could not read log file: {e}")
+        
+        log_textbox.configure(state="disabled")
+
     def create_recycle_bin_item_widget(self, path, col, row):
         name = os.path.basename(path)
         is_dir = os.path.isdir(path)
@@ -679,8 +892,12 @@ class App(ctk.CTk):
         item_frame.grid_rowconfigure(0, weight=1)
         item_frame.path = path
         
+        checkbox = ctk.CTkCheckBox(item_frame, text="")
+        checkbox.grid(row=0, column=0, sticky="nw", padx=5, pady=5)
+        self.recycle_checkboxes[path] = checkbox
+
         icon_label = ctk.CTkLabel(item_frame, text="")
-        icon_label.grid(row=0, column=0, pady=(15, 0), padx=5)
+        icon_label.grid(row=0, column=0, pady=(15, 0), padx=25)  # Adjust padx to make space for checkbox
         
         file_name_label = ctk.CTkLabel(item_frame, text=name, anchor="center", font=("Arial", 14), wraplength=self.icon_size+20)
         file_name_label.grid(row=1, column=0, padx=5, pady=(5, 10))
@@ -738,7 +955,7 @@ class App(ctk.CTk):
                 ctk.CTkLabel(self.content_view_frame, text=f"Share via WiFi is active. Go to http://{self.get_local_ip()}:{port} on another device.", wraplength=400).pack(pady=20)
                 threading.Thread(target=httpd.serve_forever).start()
         except OSError as e:
-            messagebox.showerror("Error", f"Could not start the server: {e}\nTry changing the port or checking for other running applications.")
+            messagebox.showerror("Error", f"Could not start the server: {e}\nTry checking for other running applications on port {port}.")
 
     def get_local_ip(self):
         try:
@@ -1019,22 +1236,52 @@ class App(ctk.CTk):
 
         menu.add_separator()
         menu.add_command(label="Rename", command=lambda: self.rename_item(path))
+        menu.add_command(label="Copy", command=lambda: self.copy_item(path, cut=False))
+        menu.add_command(label="Cut", command=lambda: self.copy_item(path, cut=True))
         menu.add_command(label="Delete", command=lambda: self.delete_item(path))
         menu.add_command(label="Secure Delete", command=lambda: self.secure_delete_item(path))
         menu.add_command(label="Add Tag", command=lambda: self.add_tag_to_file(path))
         menu.add_separator()
-        menu.add_command(label="Encrypt File", command=lambda: self.encrypt_file(path))
-        menu.add_command(label="Decrypt File", command=lambda: self.decrypt_file(path))
+        # menu.add_command(label="Encrypt File", command=lambda: self.encrypt_file(path))
+        # menu.add_command(label="Decrypt File", command=lambda: self.decrypt_file(path))
         menu.add_command(label="Get MD5 Hash", command=lambda: self.get_file_hash(path, "md5"))
         menu.add_separator()
         menu.add_command(label="Restore Old Version", command=lambda: self.restore_version(path))
-
+        
+        # New "Open With" and "Open in Terminal" features
+        if is_dir:
+            menu.add_command(label="Open in Terminal", command=lambda: self.open_in_terminal(path))
+        else:
+            menu.add_command(label="Open With...", command=lambda: self.open_with_dialog(path))
+        
         def show_menu(event):
             menu.post(event.x_root, event.y_root)
 
         item_frame.bind("<Button-3>", show_menu)
         icon_label.bind("<Button-3>", show_menu)
         file_name_label.bind("<Button-3>", show_menu)
+    
+    def open_in_terminal(self, path):
+        try:
+            if sys.platform == "win32":
+                subprocess.Popen(f'start cmd /K "cd /d {path}"', shell=True)
+            elif sys.platform == "darwin":
+                subprocess.Popen(['open', '-a', 'Terminal', path])
+            else:
+                subprocess.Popen(['gnome-terminal', '--working-directory', path])
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open terminal: {e}")
+
+    def open_with_dialog(self, path):
+        try:
+            if sys.platform == "win32":
+                os.startfile(path, 'open')
+            elif sys.platform == "darwin":
+                subprocess.Popen(['open', '-a', 'Finder', path])
+            else:
+                subprocess.Popen(['xdg-open', path])
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open file with default application: {e}")
 
     def show_file_details_and_select(self, path, frame):
         if self.selected_item_frame:
@@ -1051,7 +1298,26 @@ class App(ctk.CTk):
             return self.icons["folder"]
         
         file_extension = os.path.splitext(name)[1].lower()
-        if file_extension in ('.png', '.jpg', '.jpeg', '.gif', '.bmp'):
+        
+        if OPENCV_AVAILABLE and file_extension in ('.mp4', '.mkv', '.avi', '.mov'):
+            try:
+                cap = cv2.VideoCapture(path)
+                if cap.isOpened():
+                    ret, frame = cap.read()
+                    if ret:
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        img = Image.fromarray(frame_rgb)
+                        img.thumbnail(size, Image.LANCZOS)
+                        background = Image.new('RGBA', size, (0, 0, 0, 0))
+                        paste_position = ((size[0] - img.width) // 2, (size[1] - img.height) // 2)
+                        background.paste(img, paste_position)
+                        cap.release()
+                        return ImageTk.PhotoImage(background)
+                    cap.release()
+            except Exception as e:
+                print(f"Error creating video thumbnail for {name}: {e}")
+            return self.icons["video"]
+        elif file_extension in ('.png', '.jpg', '.jpeg', '.gif', '.bmp'):
             try:
                 img = Image.open(path)
                 img.thumbnail(size, Image.LANCZOS)
@@ -1064,8 +1330,22 @@ class App(ctk.CTk):
             except Exception as e:
                 print(f"Error creating thumbnail for {name}: {e}")
                 return self.icons["file"]
-        elif file_extension in ('.mp4', '.mkv', '.avi', '.mov'):
-            return self.icons["video"]
+        elif file_extension in ('.pdf', '.docx'):
+             if file_extension == '.pdf' and PDF_AVAILABLE:
+                try:
+                    pages = convert_from_path(path, first_page=1, last_page=1, dpi=200)
+                    if pages:
+                        img = pages[0]
+                        img.thumbnail(size, Image.LANCZOS)
+                        background = Image.new('RGBA', size, (0, 0, 0, 0))
+                        paste_position = ((size[0] - img.width) // 2, (size[1] - img.height) // 2)
+                        background.paste(img, paste_position)
+                        return ImageTk.PhotoImage(background)
+                except Exception as e:
+                    print(f"Error creating PDF thumbnail: {e}")
+             return self.icons["pdf"]
+        elif file_extension in ('.mp3', '.wav', '.flac'):
+            return self.icons["audio"]
         elif file_extension in ('.txt', '.log'):
             return self.icons["file_edit"]
         else:
@@ -1184,20 +1464,33 @@ class App(ctk.CTk):
         restore_button = ctk.CTkButton(dialog_window, text="Restore", command=do_restore)
         restore_button.pack(pady=10)
 
-
     def show_file_details(self, path):
+        # Clear previous details
+        for widget in self.detail_info_frame.winfo_children():
+            widget.destroy()
+
         self.detail_name_label.configure(text=os.path.basename(path))
-        info = f"Size: {self.get_file_info(path)}\n"
-        info += f"Modified: {datetime.fromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d %H:%M:%S')}\n"
-        
-        tags_list = self.tags.get(path, [])
-        info += f"Tags: {', '.join(tags_list) if tags_list else 'None'}\n"
-        
-        self.detail_info_label.configure(text=info)
+        self.detail_image_label.configure(image=None, text="")
         
         file_extension = os.path.splitext(path)[1].lower()
+        
+        info_text = f"Type: {file_extension.upper() if not os.path.isdir(path) else 'Folder'}\n"
+        info_text += f"Size: {self.get_file_info(path)}\n"
+        
+        try:
+            modified_time = datetime.fromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d %H:%M:%S')
+            info_text += f"Modified: {modified_time}\n"
+        except FileNotFoundError:
+            pass
+
+        tags_list = self.tags.get(path, [])
+        info_text += f"Tags: {', '.join(tags_list) if tags_list else 'None'}\n"
+        
+        ctk.CTkLabel(self.detail_info_frame, text=info_text, justify="left", wraplength=280).pack(pady=(0, 10), padx=0, anchor="w")
+
         if os.path.isdir(path):
-             self.detail_image_label.configure(image=self.icons["folder"], text="")
+            self.detail_image_label.configure(image=self.icons["folder"])
+        
         elif file_extension in ('.png', '.jpg', '.jpeg', '.gif', '.bmp'):
             try:
                 img = Image.open(path)
@@ -1205,43 +1498,185 @@ class App(ctk.CTk):
                 photo = ImageTk.PhotoImage(img)
                 self.detail_image_label.configure(image=photo, text="")
                 self.detail_image_label.image = photo
-            except Exception as e:
-                print(f"Error creating thumbnail for details panel: {e}")
-                self.detail_image_label.configure(image=self.icons["file"], text="")
-        else:
-            self.detail_image_label.configure(image=self.get_thumbnail(path, os.path.basename(path)), text="")
+            except Exception:
+                self.detail_image_label.configure(image=self.icons["file"])
 
+        elif file_extension in ('.mp3', '.wav', '.flac'):
+            self.detail_image_label.configure(image=self.icons["audio"], text="")
+            
+            if MUTAGEN_AVAILABLE:
+                try:
+                    audio = None
+                    if file_extension == '.mp3':
+                        audio = MP3(path)
+                    elif file_extension == '.wav':
+                        audio = WAVE(path)
+                    elif file_extension == '.flac':
+                        audio = FLAC(path)
+                        
+                    if audio and hasattr(audio.info, 'length'):
+                        self.audio_length = int(audio.info.length)
+                        minutes = self.audio_length // 60
+                        seconds = self.audio_length % 60
+                        ctk.CTkLabel(self.detail_info_frame, text=f"Duration: {minutes:02d}:{seconds:02d}", font=("Arial", 12)).pack(pady=5, anchor="w")
+                except Exception as e:
+                    print(f"Error reading audio duration: {e}")
+                    self.audio_length = 0
+            
+            if PYGAME_AVAILABLE:
+                audio_frame = ctk.CTkFrame(self.detail_info_frame, fg_color="transparent")
+                audio_frame.pack(pady=10)
+                
+                self.time_label = ctk.CTkLabel(audio_frame, text="00:00 / 00:00")
+                self.time_label.pack(side="top")
+
+                ctk.CTkButton(audio_frame, text="Play", image=self.icons["play"], compound="left", command=lambda p=path: self.play_audio(p)).pack(side="left", padx=5)
+                ctk.CTkButton(audio_frame, text="Stop", image=self.icons["stop"], compound="left", command=self.stop_audio).pack(side="left", padx=5)
+                self.loop_button = ctk.CTkButton(audio_frame, text="Loop", image=self.icons["loop"], compound="left", command=self.toggle_loop_audio)
+                self.loop_button.pack(side="left", padx=5)
+                if self.loop_audio:
+                    self.loop_button.configure(fg_color="green")
+                else:
+                    self.loop_button.configure(fg_color="gray")
+            else:
+                ctk.CTkLabel(self.detail_info_frame, text="Audio player not available (Pygame not installed)", text_color="red").pack(pady=10)
+        
+        elif file_extension in ('.mp4', '.mkv', '.avi', '.mov'):
+            self.detail_image_label.configure(image=self.get_thumbnail(path, os.path.basename(path)))
+            ctk.CTkButton(self.detail_info_frame, text="Open Video", command=lambda p=path: self.open_item(p, False)).pack(pady=10)
+            
+        elif file_extension in ('.txt', '.log', '.md'):
+            self.detail_image_label.configure(image=self.icons["file_edit"])
+            
+            ctk.CTkLabel(self.detail_info_frame, text="File Content Preview:", font=("Arial", 14, "bold"), anchor="w").pack(fill="x", pady=(10, 5))
+            
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content_preview = f.read(500) + "..." if len(f.read()) > 500 else f.read()
+                
+                content_box = ctk.CTkTextbox(self.detail_info_frame, height=150, wrap="word", font=("Courier New", 10))
+                content_box.pack(fill="x", expand=True)
+                content_box.insert("1.0", content_preview)
+                content_box.configure(state="disabled")
+            except Exception:
+                ctk.CTkLabel(self.detail_info_frame, text="Could not read file content.", text_color="red").pack()
+        
+        elif file_extension == '.pdf' and PDF_AVAILABLE:
+            self.detail_image_label.configure(image=self.get_thumbnail(path, os.path.basename(path)))
+            ctk.CTkButton(self.detail_info_frame, text="Open PDF", command=lambda p=path: self.open_item(p, False)).pack(pady=10)
+            
+        else:
+            self.detail_image_label.configure(image=self.icons["file"])
 
     def get_file_info(self, path):
-        size_in_bytes = get_total_size(path)
-        size_in_kb = size_in_bytes / 1024
-        if size_in_kb < 1024:
-            return f"{size_in_kb:.2f} KB"
-        else:
-            size_in_mb = size_in_kb / 1024
-            return f"{size_in_mb:.2f} MB"
+        try:
+            size_bytes = os.path.getsize(path)
+            if size_bytes < 1024:
+                return f"{size_bytes} Bytes"
+            elif size_bytes < 1024**2:
+                return f"{size_bytes / 1024:.2f} KB"
+            elif size_bytes < 1024**3:
+                return f"{size_bytes / (1024**2):.2f} MB"
+            else:
+                return f"{size_bytes / (1024**3):.2f} GB"
+        except FileNotFoundError:
+            return "N/A"
+            
+    def toggle_loop_audio(self):
+        self.loop_audio = not self.loop_audio
+        self.loop_button.configure(fg_color="green" if self.loop_audio else "gray")
 
+    def play_audio(self, path):
+        if not PYGAME_AVAILABLE:
+            messagebox.showerror("Error", "Pygame is not installed. Audio playback is not supported.")
+            return
+
+        try:
+            self.current_audio_path = path  # Simpan path untuk loop
+            pygame.mixer.music.load(path)
+            pygame.mixer.music.play()
+            pygame.mixer.music.set_endevent(pygame.USEREVENT)  # Set event untuk detect akhir audio
+            self.audio_playing = True
+            self.current_play_time = 0
+            self.audio_thread = threading.Thread(target=self.update_audio_time, args=(path,), daemon=True)
+            self.audio_thread.start()
+            self.after(100, self.check_audio_end)  # Mulai polling untuk event end
+        except pygame.error as e:
+            messagebox.showerror("Audio Playback Error", f"Could not play audio file: {e}")
+
+    def stop_audio(self):
+        if PYGAME_AVAILABLE:
+            pygame.mixer.music.stop()
+            self.audio_playing = False
+            if self.audio_thread:
+                self.audio_thread = None
+            if self.time_label:
+                self.time_label.configure(text="00:00 / 00:00")
+
+    def check_audio_end(self):
+        if self.audio_playing:
+            for event in pygame.event.get():
+                if event.type == pygame.USEREVENT and self.loop_audio:
+                    pygame.mixer.music.play()  # Replay jika loop aktif
+            self.after(100, self.check_audio_end)  # Lanjutkan polling
+
+    def update_audio_time(self, path):
+        while self.audio_playing:
+            if pygame.mixer.music.get_busy():
+                self.current_play_time = pygame.mixer.music.get_pos() // 1000
+                
+                minutes = self.current_play_time // 60
+                seconds = self.current_play_time % 60
+    
+                total_minutes = self.audio_length // 60
+                total_seconds = self.audio_length % 60
+                
+                if self.time_label:
+                    self.after(0, lambda: self.time_label.configure(text=f"{minutes:02d}:{seconds:02d} / {total_minutes:02d}:{total_seconds:02d}"))
+                
+                time.sleep(1) # Perbarui setiap 1 detik
+            else:
+                # Audio selesai, reset tampilan
+                if self.time_label:
+                    self.after(0, lambda: self.time_label.configure(text="00:00 / 00:00"))
+                self.audio_playing = False
+                if self.loop_audio:
+                    self.play_audio(self.current_audio_path)  # Replay jika loop aktif (backup jika event tidak terdeteksi)
+
+    def logout(self):
+        if hasattr(self, 'httpd'):
+            self.httpd.shutdown()
+        self.destroy()
+        App()
+        
     def go_back(self):
         if len(self.nav_history) > 1:
             self.nav_history.pop()
             last_state = self.nav_history[-1]
-            view_name = last_state["view"]
-            path = last_state["path"]
-            
-            if view_name == "dashboard":
+            if last_state["view"] == "dashboard":
                 self.show_dashboard_view()
-            elif view_name == "my_files":
-                self.current_path = path
+            elif last_state["view"] == "my_files":
+                self.current_path = last_state["path"]
                 self.show_file_list_view()
-            elif view_name == "favorites":
+            elif last_state["view"] == "favorites":
                 self.show_favorites_view()
-            elif view_name == "secret_folder":
-                self.current_path = path
+            elif last_state["view"] == "secret_folder":
+                self.current_path = os.path.join(self.storage_path, "Secret")
                 self.show_file_list_view(is_secret_folder=True)
-            elif view_name == "recycle_bin":
+            elif last_state["view"] == "recycle_bin":
                 self.show_recycle_bin_view()
-            elif view_name == "settings":
+            elif last_state["view"] == "activity_log":
+                self.show_activity_log_view()
+            elif last_state["view"] == "settings":
                 self.show_settings_view()
+
+    def update_nav_history(self, view, path):
+        if view == "dashboard":
+            self.nav_history = [{"view": "dashboard", "path": self.storage_path}]
+        else:
+            current_state = {"view": view, "path": path}
+            if not self.nav_history or self.nav_history[-1] != current_state:
+                self.nav_history.append(current_state)
 
     def show_file_list_view(self, is_secret_folder=False):
         for widget in self.content_view_frame.winfo_children():
@@ -1251,277 +1686,236 @@ class App(ctk.CTk):
         self.file_list_frame.pack(fill="both", expand=True)
         self.file_list_frame.grid_columnconfigure((0, 1, 2, 3, 4), weight=1)
         
-        display_path = self.current_path.replace(self.storage_path, 'My Files')
-        if is_secret_folder:
-            display_path = "Secret Folder"
-        self.path_label.configure(text=f"Path: {display_path}")
+        if self.current_path == self.storage_path:
+            self.path_label.configure(text=f"Path: My Files")
+        else:
+            display_path = self.current_path.replace(self.storage_path, "My Files", 1)
+            self.path_label.configure(text=f"Path: {display_path}")
+
         self.back_button.grid()
         self.refresh_file_list(is_secret_folder=is_secret_folder)
 
-    def update_nav_history(self, view_name, path):
-        current_state = {"view": view_name, "path": path}
-        if not self.nav_history or self.nav_history[-1] != current_state:
-            self.nav_history.append(current_state)
-        
-        if len(self.nav_history) > 10:
-            self.nav_history.pop(0)
-
-        if len(self.nav_history) > 1:
-            self.back_button.grid()
-        else:
-            self.back_button.grid_remove()
-
     def show_create_new_menu(self):
-        menu = tk.Menu(self.create_new_button, tearoff=0)
-        
-        menu.add_command(label="New Folder", command=self.create_folder_dialog)
-        menu.add_command(label="New Text File (.txt)", command=self.create_text_file)
-        menu.add_command(label="Upload File", command=self.upload_file)
-        menu.add_command(label="Compress to ZIP", command=self.compress_files)
-        
-        try:
-            menu.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
-        finally:
-            menu.grab_release()
-
-    def create_text_file(self):
-        dialog = ctk.CTkInputDialog(text="New text file name (.txt):", title="Create Text File")
-        file_name = dialog.get_input()
-        if file_name:
-            if not file_name.endswith(".txt"):
-                file_name += ".txt"
-            file_path = os.path.join(self.current_path, file_name)
-            try:
-                if not os.path.exists(file_path):
-                    with open(file_path, "w") as f:
-                        f.write("")
-                    self.refresh_file_list()
-                    self.open_text_editor(file_path)
-                else:
-                    messagebox.showerror("Error", "File already exists!")
-            except OSError as e:
-                messagebox.showerror("Error", f"Failed to create file: {e}")
-
-    def create_folder_dialog(self):
-        dialog = ctk.CTkInputDialog(text="New folder name:", title="Create Folder")
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Create Folder", command=self.create_folder)
+        menu.add_command(label="Create Text File", command=self.create_text_file)
+        menu.post(self.create_new_button.winfo_rootx(), self.create_new_button.winfo_rooty() + self.create_new_button.winfo_height())
+    
+    def create_folder(self):
+        dialog = ctk.CTkInputDialog(text="Enter new folder name:", title="Create Folder")
         folder_name = dialog.get_input()
         if folder_name:
-            folder_path = os.path.join(self.current_path, folder_name)
-            try:
-                if not os.path.exists(folder_path):
-                    os.makedirs(folder_path)
-                    self.refresh_file_list()
-                else:
-                    messagebox.showerror("Error", "Folder already exists!")
-            except OSError as e:
-                messagebox.showerror("Error", f"Failed to create folder: {e}")
+            new_path = os.path.join(self.current_path, folder_name)
+            if not os.path.exists(new_path):
+                os.makedirs(new_path)
+                self.refresh_file_list()
+                log_activity(self.current_user, "created folder", new_path)
+            else:
+                messagebox.showerror("Error", "Folder already exists!")
 
-    def upload_file(self):
-        file_path_source = filedialog.askopenfilename()
-        if not file_path_source:
-            return
-
-        file_name = os.path.basename(file_path_source)
-        destination_path = os.path.join(self.current_path, file_name)
-
-        try:
-            if os.path.exists(destination_path):
-                base, ext = os.path.splitext(file_name)
-                i = 1
-                while os.path.exists(os.path.join(self.current_path, f"{base} ({i}){ext}")):
-                    i += 1
-                destination_path = os.path.join(self.current_path, f"{base} ({i}){ext}")
-                
-            shutil.copy2(file_path_source, destination_path)
-            log_activity(self.current_user, "uploaded", destination_path)
-            self.update_recent_files(destination_path)
-            
-            messagebox.showinfo("Success", f"File '{os.path.basename(destination_path)}' berhasil diunggah.")
-            self.refresh_file_list()
-
-        except Exception as e:
-            messagebox.showerror("Error", f"Gagal mengunggah file: {e}")
-
-    def compress_files(self):
-        selected_files = filedialog.askopenfilenames(title="Select files to compress")
-        if selected_files:
-            zip_filename = simpledialog.askstring("Compress", "ZIP file name:", parent=self)
-            if zip_filename:
-                zip_path = os.path.join(self.current_path, f"{zip_filename}.zip")
-                try:
-                    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                        for file in selected_files:
-                            zipf.write(file, os.path.basename(file))
-                    messagebox.showinfo("Success", f"Files compressed to {zip_path}")
-                    self.refresh_file_list()
-                except Exception as e:
-                    messagebox.showerror("Error", f"Failed to compress files: {e}")
-
-    def logout(self):
-        if messagebox.askyesno("Logout", "Are you sure you want to log out?"):
-            self.destroy()
-
-    def encrypt_file(self, path):
-        password = simpledialog.askstring("Encrypt", "Enter password for encryption:", parent=self, show='*')
-        if not password:
-            return
-        
-        try:
-            with open(path, 'rb') as f:
-                original_data = f.read()
-            
-            encoded_data = base64.b64encode(original_data)
-            
-            encrypted_path = path + ".enc"
-            with open(encrypted_path, 'wb') as f:
-                f.write(encoded_data)
-            
-            os.remove(path)
-            messagebox.showinfo("Success", f"File '{os.path.basename(path)}' successfully encrypted.")
-            self.refresh_file_list()
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to encrypt file: {e}")
-            
-    def decrypt_file(self, path):
-        password = simpledialog.askstring("Decrypt", "Enter password to decrypt:", parent=self, show='*')
-        if not password:
-            return
-            
-        try:
-            with open(path, 'rb') as f:
-                encrypted_data = f.read()
-            
-            decoded_data = base64.b64decode(encrypted_data)
-            
-            decrypted_path = path[:-4]
-            with open(decrypted_path, 'wb') as f:
-                f.write(decoded_data)
-            
-            os.remove(path)
-            messagebox.showinfo("Success", f"File '{os.path.basename(path)}' successfully decrypted.")
-            self.refresh_file_list()
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to decrypt file: {e}")
-
-    def get_file_hash(self, path, hash_algo="md5"):
-        try:
-            with open(path, "rb") as f:
-                bytes = f.read()
-                if hash_algo == "md5":
-                    hash_value = hashlib.md5(bytes).hexdigest()
-                else:
-                    hash_value = "Unsupported algorithm"
-            
-            dialog = ctk.CTkToplevel(self)
-            dialog.title("File Hash")
-            dialog.geometry("400x150")
-            dialog.grab_set()
-
-            ctk.CTkLabel(dialog, text=f"MD5 Hash for '{os.path.basename(path)}':", font=("Arial", 14, "bold")).pack(pady=10)
-            ctk.CTkEntry(dialog, textvariable=tk.StringVar(value=hash_value), state="readonly", width=350).pack(padx=20, pady=5)
-            ctk.CTkButton(dialog, text="Close", command=dialog.destroy).pack(pady=10)
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to get hash: {e}")
-
+    def create_text_file(self):
+        dialog = ctk.CTkInputDialog(text="Enter new file name (e.g. 'notes.txt'):", title="Create Text File")
+        file_name = dialog.get_input()
+        if file_name:
+            new_path = os.path.join(self.current_path, file_name)
+            if not os.path.exists(new_path):
+                with open(new_path, "w") as f:
+                    f.write("")
+                self.refresh_file_list()
+                log_activity(self.current_user, "created file", new_path)
+            else:
+                messagebox.showerror("Error", "File already exists!")
+    
     def secure_delete_item(self, path):
-        item_name = os.path.basename(path)
-        if not messagebox.askyesno("Secure Delete", f"Are you sure you want to securely delete '{item_name}'? This process is irreversible."):
+        if not messagebox.askyesno("Secure Delete", "Are you sure you want to securely delete this item? This is irreversible and will overwrite the data."):
             return
         
         try:
             if os.path.isdir(path):
-                for root, dirs, files in os.walk(path, topdown=False):
-                    for name in files:
-                        self._overwrite_file(os.path.join(root, name))
-                        os.remove(os.path.join(root, name))
-                    for name in dirs:
-                        os.rmdir(os.path.join(root, name))
-                os.rmdir(path)
+                shutil.rmtree(path)
             else:
                 self._overwrite_file(path)
                 os.remove(path)
-                
-            if path in self.tags:
-                del self.tags[path]
-                self.save_tags()
-                
-            messagebox.showinfo("Success", f"'{item_name}' has been securely deleted.")
-            self.refresh_file_list()
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to securely delete '{item_name}': {e}")
             
+            messagebox.showinfo("Success", f"'{os.path.basename(path)}' has been securely deleted.")
+            if self.nav_history[-1]["view"] in ["my_files", "secret_folder", "recycle_bin"]:
+                self.refresh_file_list()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to perform secure deletion: {e}")
+
     def _overwrite_file(self, path, passes=3):
         try:
-            with open(path, "ba+") as f:
-                f.seek(0)
-                filesize = f.tell()
+            file_size = os.path.getsize(path)
+            with open(path, "r+b") as f:
                 for _ in range(passes):
                     f.seek(0)
-                    f.write(os.urandom(filesize))
+                    random_data = os.urandom(file_size)
+                    f.write(random_data)
                     f.flush()
-                    os.fsync(f.fileno())
-        except FileNotFoundError:
-            pass
         except Exception as e:
-            print(f"Error during file overwrite: {e}")
+            raise IOError(f"Failed to overwrite file data: {e}")
+            
+    # def encrypt_file(self, path):
+    #     messagebox.showinfo("Info", "Encryption feature is under development.")
+        
+    # def decrypt_file(self, path):
+    #     messagebox.showinfo("Info", "Decryption feature is under development.")
 
+    def get_file_hash(self, path, algorithm="md5"):
+        try:
+            with open(path, "rb") as f:
+                if algorithm == "md5":
+                    hasher = hashlib.md5()
+                else:
+                    messagebox.showerror("Error", "Unsupported hash algorithm.")
+                    return
+                
+                while chunk := f.read(4096):
+                    hasher.update(chunk)
+            
+            hash_value = hasher.hexdigest()
+            messagebox.showinfo("File Hash", f"{algorithm.upper()} Hash of '{os.path.basename(path)}':\n\n{hash_value}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not calculate hash: {e}")
+
+    def copy_item(self, path, cut=False):
+        self.copied_path = path
+        self.cut_mode = cut
+        action = "cut" if cut else "copied"
+        messagebox.showinfo("Clipboard", f"'{os.path.basename(path)}' {action} to clipboard.")
+
+    def paste_item(self):
+        if self.copied_path:
+            item_name = os.path.basename(self.copied_path)
+            dest = os.path.join(self.current_path, item_name)
+
+            if os.path.exists(dest):
+                base, ext = os.path.splitext(item_name)
+                i = 1
+                while os.path.exists(os.path.join(self.current_path, f"{base} ({i}){ext}")):
+                    i += 1
+                dest = os.path.join(self.current_path, f"{base} ({i}){ext}")
+
+            try:
+                if self.cut_mode:
+                    shutil.move(self.copied_path, dest)
+                    self.copied_path = None
+                    self.cut_mode = False
+                    action = "moved"
+                else:
+                    if os.path.isdir(self.copied_path):
+                        shutil.copytree(self.copied_path, dest)
+                    else:
+                        shutil.copy2(self.copied_path, dest)
+                    action = "copied"
+
+                log_activity(self.current_user, action, f"from {self.copied_path} to {dest}")
+                messagebox.showinfo("Success", f"'{item_name}' {action} to current folder.")
+                self.refresh_file_list()
+                return
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to paste item: {e}")
+                return
+
+        # If no internal copy, try pasting from system clipboard (image or file)
+        self.paste_from_clipboard()
+
+    def paste_from_clipboard(self):
+        if sys.platform not in ("win32", "darwin"):
+            messagebox.showinfo("Info", "Pasting from clipboard is supported on Windows and macOS only.")
+            return
+
+        try:
+            clipboard_content = ImageGrab.grabclipboard()
+            if clipboard_content is None:
+                messagebox.showinfo("Info", "Clipboard is empty.")
+                return
+
+            if isinstance(clipboard_content, Image.Image):
+                # Handle image
+                file_name = simpledialog.askstring("Paste Image", "Enter file name (e.g., image.png):", parent=self)
+                if not file_name:
+                    return
+
+                dest = os.path.join(self.current_path, file_name)
+                if os.path.exists(dest):
+                    messagebox.showerror("Error", "File already exists.")
+                    return
+
+                clipboard_content.save(dest)
+                log_activity(self.current_user, "pasted image from clipboard", dest)
+                messagebox.showinfo("Success", f"Image pasted as '{file_name}'.")
+                self.refresh_file_list()
+
+            elif isinstance(clipboard_content, list):
+                # Handle file paths (copied files)
+                for src_path in clipboard_content:
+                    if os.path.exists(src_path):
+                        item_name = os.path.basename(src_path)
+                        dest = os.path.join(self.current_path, item_name)
+
+                        if os.path.exists(dest):
+                            base, ext = os.path.splitext(item_name)
+                            i = 1
+                            while os.path.exists(os.path.join(self.current_path, f"{base} ({i}){ext}")):
+                                i += 1
+                            dest = os.path.join(self.current_path, f"{base} ({i}){ext}")
+
+                        if os.path.isdir(src_path):
+                            shutil.copytree(src_path, dest)
+                        else:
+                            shutil.copy2(src_path, dest)
+
+                        log_activity(self.current_user, "pasted file from clipboard", dest)
+                messagebox.showinfo("Success", "Files pasted from clipboard.")
+                self.refresh_file_list()
+
+            else:
+                messagebox.showinfo("Info", "Unsupported clipboard content.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to paste from clipboard: {e}")
+
+# --- WiFi Sharing Handler (placeholder) ---
 class MyHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     storage_path = None
     
-    def do_POST(self):
-        if self.path == '/upload':
-            content_type = self.headers.get('Content-Type')
-            if not content_type.startswith('multipart/form-data'):
-                self.send_response(400)
-                self.end_headers()
+    def do_GET(self):
+        try:
+            file_path = os.path.join(self.storage_path, self.path.strip("/"))
+            if os.path.commonpath([self.storage_path]) != os.path.commonpath([self.storage_path, file_path]):
+                self.send_error(403, "Forbidden")
                 return
 
-            try:
-                form_data = self.read_multipart_form_data()
-                if 'file' in form_data:
-                    file_info = form_data['file']
-                    file_name = file_info['filename']
-                    file_content = file_info['content']
-                    
-                    upload_path = os.path.join(self.storage_path, file_name)
-                    with open(upload_path, 'wb') as f:
-                        f.write(file_content)
-                    
-                    self.send_response(200)
-                    self.end_headers()
-                    self.wfile.write(b"File uploaded successfully!")
-                else:
-                    self.send_response(400)
-                    self.end_headers()
-                    self.wfile.write(b"No file received.")
-            except Exception as e:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(f"An error occurred: {e}".encode())
+            if os.path.isdir(file_path):
+                self.list_directory(file_path)
+            else:
+                super().do_GET()
+        except Exception as e:
+            self.send_error(500, f"Server error: {e}")
 
-    def read_multipart_form_data(self, boundary):
-        data = {}
-        content_length = int(self.headers['Content-Length'])
-        post_data = self.rfile.read(content_length)
-        
-        parts = post_data.split(b'--' + boundary)
-        
-        for part in parts:
-            if not part or part == b'--\r\n':
-                continue
+    def list_directory(self, path):
+        try:
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
             
-            header, content = part.split(b'\r\n\r\n', 1)
+            self.wfile.write(b"<html><head><title>Explo File Share</title></head><body>")
+            self.wfile.write(f"<h1>Directory Listing for {path}</h1>".encode())
+            self.wfile.write(b"<ul>")
             
-            header_str = header.decode()
-            
-            if 'Content-Disposition' in header_str:
-                disposition = header_str.split('Content-Disposition: ')[1]
-                if 'filename=' in disposition:
-                    filename = disposition.split('filename=')[1].strip().replace('"', '')
-                    data['file'] = {'filename': filename.encode().decode('unicode_escape'), 'content': content.strip()}
+            if path != self.storage_path:
+                parent_dir = os.path.dirname(path)
+                self.wfile.write(f'<li><a href="{os.path.relpath(parent_dir, self.storage_path)}">..</a></li>'.encode())
 
-        return data
-        
+            for item in os.listdir(path):
+                item_path = os.path.join(path, item)
+                rel_path = os.path.relpath(item_path, self.storage_path)
+                self.wfile.write(f'<li><a href="{rel_path}">{item}</a></li>'.encode())
+            
+            self.wfile.write(b"</ul></body></html>")
+        except Exception as e:
+            self.send_error(500, f"Error listing directory: {e}")
+
 if __name__ == "__main__":
     app = App()
     app.mainloop()
